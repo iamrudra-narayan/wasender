@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.zencoder
+.wwebjs_auth
+.wwebjs_cache

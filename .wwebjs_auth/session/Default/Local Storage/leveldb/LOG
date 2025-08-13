@@ -1,4 +1,0 @@
-2025/08/13-16:53:25.989 5efc Creating DB C:\Users\Rudra\Desktop\RUDRAWTSAPPTEST\.wwebjs_auth\session\Default\Local Storage\leveldb since it was missing.
-2025/08/13-16:53:26.031 5efc Reusing MANIFEST C:\Users\Rudra\Desktop\RUDRAWTSAPPTEST\.wwebjs_auth\session\Default\Local Storage\leveldb/MANIFEST-000001
-2025/08/13-16:53:26.032 5efc Recovering log #3
-2025/08/13-16:53:26.033 5efc Reusing old log C:\Users\Rudra\Desktop\RUDRAWTSAPPTEST\.wwebjs_auth\session\Default\Local Storage\leveldb/000003.log 

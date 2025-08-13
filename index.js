@@ -2,7 +2,9 @@
 'use strict';
 
 const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, RemoteAuth } = require('whatsapp-web.js');
+const { MongoStore } = require('wwebjs-mongo');
+const mongoose = require('mongoose');
 const qrcode = require('qrcode');
 const dotenv = require('dotenv');
 const swaggerUi = require('swagger-ui-express');
@@ -12,16 +14,19 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
 
 dotenv.config();
 
-/* ---------- Config ---------- */
-const PORT = process.env.PORT || 3000;
+/* ---------- Config (kept same) ---------- */
+const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-const API_PASSWORD = process.env.API_PASSWORD || process.env.API_KEY || process.env.PASSWORD;
+const API_PASSWORD = process.env.API_PASSWORD || process.env.API_KEY || process.env.PASSWORD || '';
 const QR_USERNAME = process.env.QR_USERNAME || 'admin';
 const QR_PASSWORD = process.env.QR_PASSWORD || 'admin123';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change-me-now-in-prod';
@@ -29,30 +34,43 @@ const AUTH_COOKIE_NAME = 'qr_auth';
 const hours = Number(process.env.AUTH_COOKIE_MAX_AGE_HRS) || 24;
 const AUTH_COOKIE_MAX_AGE_MS = hours * 60 * 60 * 1000;
 
+const MONGO_URI = process.env.MONGO_URI || '';
+
+// Where to store whatsapp-web.js auth/cache for local
+const WWEBJS_DATA_DIR = process.env.WWEBJS_DATA_DIR || path.join(__dirname, '.wwebjs_data');
+const SESSION_DIR = path.join(WWEBJS_DATA_DIR, 'auth');  // LocalAuth dataPath
+const CACHE_DIR = path.join(WWEBJS_DATA_DIR, 'cache');   // optional: for any cache you want to keep separate
+
 if (!API_PASSWORD) {
   console.warn('WARNING: API_PASSWORD is not set. Set API_PASSWORD in your .env for API protection.');
 }
+if (!MONGO_URI) {
+  console.warn('NOTICE: MONGO_URI not set — running in LocalAuth (disk) mode. For Render/no-disk set MONGO_URI to use RemoteAuth.');
+}
+
+// ensure local dirs exist (harmless if using remote)
+try { fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch {}
 
 /* ---------- App ---------- */
 const app = express();
 app.set('trust proxy', 1);
-app.use(helmet({
-  contentSecurityPolicy: false, // for inline styles in minimal pages
-}));
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '512kb' }));
+app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 /* ---------- Rate limits ---------- */
 const loginLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, // 10 minutes
+  windowMs: 10 * 60 * 1000,
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
 });
 const qrLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
+  windowMs: 60 * 1000,
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
@@ -81,10 +99,7 @@ const swaggerSpec = {
             properties: { password: { type: 'string', example: 'YOUR_API_PASSWORD' } }
           } } }
         },
-        responses: {
-          200: { description: 'Status' },
-          401: { description: 'Unauthorized' }
-        }
+        responses: { 200: { description: 'Status' }, 401: { description: 'Unauthorized' } }
       }
     },
     '/send-message': {
@@ -137,48 +152,17 @@ const swaggerSpec = {
     }
   }
 };
-
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.get('/docs.json', (req, res) => res.json(swaggerSpec));
 
-/* ---------- WhatsApp Client ---------- */
-const client = new Client({
-  authStrategy: new LocalAuth({
-    dataPath: './.wwebjs_auth', // uncomment to pin a folder
-  }),
-});
-
-let lastQr = null;      // raw QR string
-let lastQrAt = null;    // timestamp (ms)
+/* ---------- Globals for auth/store + WA ---------- */
+let store = null;       // MongoStore (when using RemoteAuth)
+let client = null;      // whatsapp client
+let lastQr = null;
+let lastQrAt = null;
 let isReady = false;
-
-client.on('qr', (qr) => {
-  lastQr = qr;
-  lastQrAt = Date.now();
-  isReady = false;
-  console.log('[WA] New QR generated.');
-});
-
-client.on('ready', () => {
-  isReady = true;
-  console.log('[WA] Client is ready.');
-});
-
-client.on('authenticated', () => {
-  console.log('[WA] Authenticated.');
-});
-
-client.on('disconnected', (reason) => {
-  console.warn('[WA] Disconnected:', reason);
-  isReady = false;
-});
-
-client.on('auth_failure', (msg) => {
-  console.error('[WA] Auth failure:', msg);
-  isReady = false;
-});
-
-client.initialize();
+let authMode = 'local'; // 'local' or 'remote'
+let initializingClient = false;
 
 /* ---------- Helpers ---------- */
 function verifyPasswordInBody(req, res, next) {
@@ -190,7 +174,11 @@ function verifyPasswordInBody(req, res, next) {
 }
 
 function signQrSession(username) {
-  return jwt.sign({ u: username, t: Date.now() }, SESSION_SECRET, { expiresIn: Math.floor(AUTH_COOKIE_MAX_AGE_MS / 1000) });
+  return jwt.sign(
+    { u: username, t: Date.now() },
+    SESSION_SECRET,
+    { expiresIn: Math.floor(AUTH_COOKIE_MAX_AGE_MS / 1000) }
+  );
 }
 
 function requireQrSession(req, res, next) {
@@ -210,16 +198,161 @@ function redirectToLogin(res) {
 }
 
 async function sendWhatsAppMessage(phone, message) {
+  if (!isReady || !client) throw new Error('WhatsApp client not ready');
   const chatId = `${String(phone).replace(/[^\d]/g, '')}@c.us`;
-  await client.sendMessage(chatId, message);
+  return client.sendMessage(chatId, message);
 }
 
-/* ---------- Health ---------- */
-app.get('/healthz', (req, res) => {
-  res.json({ ok: true, isReady });
-});
+async function rimraf(dir) {
+  try { await fsp.rm(dir, { recursive: true, force: true }); } catch (e) {}
+  try { await fsp.mkdir(dir, { recursive: true }); } catch (e) {}
+}
 
-/* ---------- APIs (Protected via password in body) ---------- */
+/* ---------- Init mongoose + store (if MONGO_URI present) ---------- */
+async function initMongooseStoreIfNeeded() {
+  if (!MONGO_URI) {
+    authMode = 'local';
+    console.log('[AUTH] No MONGO_URI — using LocalAuth (disk) mode');
+    return;
+  }
+
+  // connect mongoose (needed for wwebjs-mongo MongoStore)
+  authMode = 'remote';
+  console.log('[AUTH] MONGO_URI found — using RemoteAuth (MongoStore) mode');
+
+  mongoose.set('strictQuery', false);
+  // small retry loop for transient connect issues
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await mongoose.connect(MONGO_URI, {
+        // Mongoose v6+ defaults are fine; optionally set dbName in URI or here.
+      });
+      console.log('✅ Mongoose connected');
+      break;
+    } catch (err) {
+      console.warn(`[MONGO] connect attempt ${attempt} failed:`, err && err.message ? err.message : err);
+      if (attempt === maxAttempts) throw err;
+      await new Promise(r => setTimeout(r, 1500 * attempt));
+    }
+  }
+
+  // Create the MongoStore using mongoose instance (this is what's required)
+  store = new MongoStore({ mongoose });
+  console.log('✅ MongoStore created and ready');
+}
+
+/* ---------- Build WhatsApp client (chooses LocalAuth or RemoteAuth) ---------- */
+function buildClient() {
+  const authStrategy = (authMode === 'remote' && store)
+    ? new RemoteAuth({ store, backupSyncIntervalMs: 300000 })
+    : new LocalAuth({ dataPath: SESSION_DIR });
+
+  const c = new Client({
+    authStrategy,
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+        '--window-size=1280,800'
+      ],
+    },
+    takeoverOnConflict: true,
+  });
+
+  c.on('qr', (qr) => {
+    lastQr = qr;
+    lastQrAt = Date.now();
+    isReady = false;
+    console.log('[WA] New QR generated.');
+  });
+
+  c.on('ready', () => {
+    isReady = true;
+    lastQr = null;
+    lastQrAt = null;
+    console.log('[WA] Client is ready.');
+  });
+
+  c.on('authenticated', () => {
+    console.log('[WA] Authenticated.');
+    lastQr = null;
+    lastQrAt = null;
+  });
+
+  c.on('auth_failure', (msg) => {
+    console.error('[WA] Auth failure:', msg);
+    isReady = false;
+    // Rebuild after short backoff
+    setTimeout(() => tryRebuildClient('[auth_failure]').catch(e => console.error('[WA] rebuild after auth_failure failed', e)), 2000);
+  });
+
+  c.on('disconnected', async (reason) => {
+    console.warn('[WA] Disconnected:', reason);
+    isReady = false;
+    // ensure current instance destroyed then rebuild
+    try { await c.destroy(); } catch (e) { /* ignore */ }
+    setTimeout(() => tryRebuildClient('[disconnected]').catch(e => console.error('[WA] rebuild after disconnected failed', e)), 2000);
+  });
+
+  c.on('change_state', (state) => {
+    console.log('[WA] State:', state);
+  });
+
+  return c;
+}
+
+/* ---------- Safely rebuild client ---------- */
+async function tryRebuildClient(reason = '') {
+  if (initializingClient) {
+    console.log('[WA] Already initializing client, skipping rebuild request:', reason);
+    return;
+  }
+  initializingClient = true;
+  console.log(`[WA] Rebuilding client ${reason}`);
+
+  // cleanup previous
+  try {
+    if (client && client.destroy) {
+      try { await client.destroy(); } catch (ignored) {}
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // if remote mode ensure store present
+  if (authMode === 'remote' && !store) {
+    console.error('[WA] Cannot build remote client because store is not ready');
+    initializingClient = false;
+    throw new Error('Mongo store not ready');
+  }
+
+  client = buildClient();
+
+  try {
+    await client.initialize();
+    console.log('[WA] New client initialized.');
+  } catch (err) {
+    console.error('[WA] Error initializing client:', err && err.message ? err.message : err);
+    initializingClient = false;
+    throw err;
+  }
+
+  initializingClient = false;
+}
+
+/* ---------- Health / keepalive ---------- */
+app.get('/healthz', (req, res) => res.json({ ok: true, isReady }));
+setInterval(() => console.log('[KEEPALIVE] tick'), 5 * 60 * 1000);
+
+/* ---------- APIs (protected) - kept exactly as your original ---------- */
 app.post('/status', verifyPasswordInBody, (req, res) => {
   const ageSec = lastQrAt ? Math.max(0, Math.round((Date.now() - lastQrAt) / 1000)) : null;
   res.json({ status: 'success', isReady, lastQrAt, lastQrAgeSec: ageSec });
@@ -228,17 +361,13 @@ app.post('/status', verifyPasswordInBody, (req, res) => {
 app.post('/send-message', verifyPasswordInBody, async (req, res) => {
   try {
     const { phone_number, message } = req.body || {};
-    if (!phone_number || !message) {
-      return res.status(400).json({ status: 'error', message: 'phone_number and message are required' });
-    }
-    if (!isReady) {
-      return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
-    }
+    if (!phone_number || !message) return res.status(400).json({ status: 'error', message: 'phone_number and message are required' });
+    if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
     await sendWhatsAppMessage(phone_number, message);
     return res.json({ status: 'success', sent_to: phone_number });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ status: 'error', message: err.message });
+    console.error('[SEND]', err && err.message ? err.message : err);
+    return res.status(500).json({ status: 'error', message: err.message || String(err) });
   }
 });
 
@@ -248,9 +377,7 @@ app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
     if (!Array.isArray(phone_numbers) || phone_numbers.length === 0 || !message) {
       return res.status(400).json({ status: 'error', message: 'phone_numbers (non-empty array) and message are required' });
     }
-    if (!isReady) {
-      return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
-    }
+    if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
     const sent_to = [];
     const failed_to = [];
     for (const phone of phone_numbers) {
@@ -258,17 +385,17 @@ app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
         await sendWhatsAppMessage(phone, message);
         sent_to.push(phone);
       } catch (e) {
-        failed_to.push({ phone, error: e.message });
+        failed_to.push({ phone, error: e.message || String(e) });
       }
     }
     return res.json({ status: 'success', sent_to, failed_to });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ status: 'error', message: err.message });
+    console.error('[SENDBULK]', err && err.message ? err.message : err);
+    return res.status(500).json({ status: 'error', message: err.message || String(err) });
   }
 });
 
-/* ---------- QR Portal (Session Login + UI) ---------- */
+/* ---------- QR Portal + Login UI (kept fully as you provided) ---------- */
 
 // Login page (GET)
 app.get('/qr/login', loginLimiter, (req, res) => {
@@ -278,7 +405,7 @@ app.get('/qr/login', loginLimiter, (req, res) => {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>QR Portal Login</title>
+<title>KpiX WhatsApp Registration Portal</title>
 <style>
 :root{--bg:#0b1020;--card:#121933;--muted:#9aa3b2;--accent:#7c3aed;--ok:#16a34a;--warn:#f59e0b;}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#0b1020,#0b1020 60%,#10162b);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:#e5e7eb;display:grid;place-items:center;min-height:100vh;padding:24px}
@@ -288,9 +415,8 @@ label{display:block;margin:12px 0 6px;color:#cfd7e3;font-size:13px}
 input{width:100%;padding:12px 14px;border:1px solid #2a3559;background:#0e1531;color:#e5e7eb;border-radius:12px;outline:none}
 button{width:100%;padding:12px 14px;margin-top:16px;background:var(--accent);border:none;border-radius:12px;color:#fff;font-weight:600;cursor:pointer}
 button:active{transform:translateY(1px)}
-small{display:block;margin-top:10px;color:var(--muted)}
+small{display:block;margin-top:10px;color:#9aa3b2}
 .footer{margin-top:14px;text-align:center}
-.err{color:#ff6b6b;margin:8px 0 0;min-height:18px}
 </style>
 </head>
 <body>
@@ -325,7 +451,6 @@ app.post('/qr/login', loginLimiter, (req, res) => {
       secure: NODE_ENV === 'production',
       sameSite: 'lax',
       maxAge: AUTH_COOKIE_MAX_AGE_MS,
-      signed: false,
     });
     return res.redirect('/qr');
   }
@@ -341,17 +466,12 @@ app.post('/qr/logout', requireQrSession, (req, res) => {
 // QR page (requires session)
 app.get('/qr', qrLimiter, requireQrSession, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>KpiX WhatsApp Login</title>
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KpiX WhatsApp Login</title>
 <style>
 :root{--bg:#0b1020;--card:#121933;--muted:#9aa3b2;--ok:#16a34a;--warn:#f59e0b;--bad:#ef4444}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:#e5e7eb;min-height:100vh}
 .wrap{max-width:860px;margin:0 auto;padding:24px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.header{display:flex;gap:12px;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 h1{font-size:22px;margin:0}
 small{color:var(--muted)}
 .card{border:1px solid #1f2a44;background:var(--card);border-radius:16px;padding:16px}
@@ -364,6 +484,7 @@ img{width:100%;height:auto;border-radius:12px;background:#0e1531}
 .badge.bad{background:#2a1010;color:#ffb4b4;border:1px solid #5a1d1d}
 .btn{appearance:none;border:1px solid #2b3b67;background:#101938;color:#e5e7eb;border-radius:10px;padding:8px 12px;cursor:pointer}
 .btn:active{transform:translateY(1px)}
+.row{display:flex;gap:8px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -371,9 +492,16 @@ img{width:100%;height:auto;border-radius:12px;background:#0e1531}
     <div class="header">
       <div>
         <h1>WhatsApp Device Link</h1>
-        <small>Scan the QR code below with WhatsApp &rarr; Linked devices.</small>
+        <small>Scan the QR code below with WhatsApp → Linked devices.</small>
       </div>
-      <form method="POST" action="/qr/logout"><button class="btn" type="submit">Logout</button></form>
+      <div class="row">
+        <form method="POST" action="/qr/disconnect" onsubmit="return confirm('Disconnect and reset session? You will need to scan a new QR.');">
+          <button class="btn" type="submit">Disconnect & Reset</button>
+        </form>
+        <form method="POST" action="/qr/logout">
+          <button class="btn" type="submit">Logout</button>
+        </form>
+      </div>
     </div>
 
     <div class="grid">
@@ -421,8 +549,7 @@ async function refresh(){
 refresh();
 setInterval(refresh, 5000);
 </script>
-</body>
-</html>`);
+</body></html>`);
 });
 
 // QR image (requires session)
@@ -437,6 +564,7 @@ app.get('/qr-image.png', qrLimiter, requireQrSession, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.send(buffer);
   } catch (err) {
+    console.error('[QRIMG]', err && err.message ? err.message : err);
     return res.status(500).json({ status: 'error', message: 'Failed to generate QR image' });
   }
 });
@@ -448,28 +576,74 @@ app.get('/qr-status', qrLimiter, requireQrSession, (req, res) => {
   res.json({ isReady, lastQrAt, lastQrAgeSec: ageSec });
 });
 
-/* ---------- Error handling ---------- */
-app.use((req, res) => {
-  res.status(404).json({ status: 'error', message: 'Not Found' });
+// Disconnect & Reset (wipe auth+cache, reinit, show fresh QR)
+app.post('/qr/disconnect', qrLimiter, requireQrSession, async (req, res) => {
+  try {
+    console.log('[RESET] Disconnect requested. Wiping session & cache…');
+    try { if (client && client.destroy) await client.destroy(); } catch (e) {}
+    await rimraf(SESSION_DIR);
+    await rimraf(CACHE_DIR);
+    lastQr = null;
+    lastQrAt = null;
+    isReady = false;
+    // rebuild & re-init client so a new QR is produced
+    try {
+      await tryRebuildClient('[reset]');
+    } catch (err) {
+      console.error('[RESET] Rebuild failed:', err && err.message ? err.message : err);
+    }
+    res.redirect('/qr'); // back to portal; it will poll and show the new QR
+  } catch (err) {
+    console.error('[RESET] Failed:', err && err.message ? err.message : err);
+    res.status(500).type('html').send('<p style="font-family:system-ui;color:#d33">Failed to reset. Check server logs.</p>');
+  }
 });
 
+/* ---------- Error handling ---------- */
+app.use((req, res) => res.status(404).json({ status: 'error', message: 'Not Found' }));
+
 app.use((err, req, res, next) => {
-  console.error('[UNCAUGHT]', err);
+  console.error('[UNCAUGHT]', err && err.message ? err.message : err);
   res.status(500).json({ status: 'error', message: 'Internal Server Error' });
 });
 
 /* ---------- Graceful shutdown ---------- */
-function shutdown() {
-  console.log('Shutting down...');
-  try { client.destroy(); } catch {}
+async function shutdown() {
+  console.log('Shutting down…');
+  try { if (client && client.destroy) await client.destroy(); } catch (e) { /* ignore */ }
+  try { if (authMode === 'remote') await mongoose.disconnect(); } catch (e) { /* ignore */ }
   process.exit(0);
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-/* ---------- Start ---------- */
-app.listen(PORT, HOST, () => {
-  console.log(`Server running at ${PUBLIC_URL}`);
-  console.log(`Swagger docs: ${PUBLIC_URL}/docs`);
-  console.log(`QR Portal: ${PUBLIC_URL}/qr/login`);
-});
+/* ---------- Top-level error handlers ---------- */
+process.on('unhandledRejection', (reason, p) => console.error('[UNHANDLED REJECTION]', reason, p));
+process.on('uncaughtException', (err) => console.error('[UNCAUGHT EXCEPTION]', err));
+
+/* ---------- Start: init store (if needed) -> init client -> start server ---------- */
+(async () => {
+  try {
+    await initMongooseStoreIfNeeded();
+    // ensure client initialization occurs before server becomes usable
+    await tryRebuildClient('[startup]');
+
+    const server = app.listen(PORT, HOST, () => {
+      console.log(`Server running at ${PUBLIC_URL}`);
+      console.log(`Swagger docs: ${PUBLIC_URL}/docs`);
+      console.log(`QR Portal: ${PUBLIC_URL}/qr/login`);
+      console.log(`[Paths] WWEBJS_DATA_DIR=${WWEBJS_DATA_DIR} (LocalAuth if no MONGO_URI)`);
+    });
+
+    server.on('error', (err) => {
+      if (err && err.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} already in use. Use a different PORT or stop the process using it.`);
+      } else {
+        console.error('Server error:', err);
+      }
+    });
+  } catch (err) {
+    console.error('[STARTUP] Failed to start:', err && err.message ? err.message : err);
+    process.exit(1);
+  }
+})();

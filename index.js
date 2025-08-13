@@ -144,7 +144,7 @@ app.get('/docs.json', (req, res) => res.json(swaggerSpec));
 /* ---------- WhatsApp Client ---------- */
 const client = new Client({
   authStrategy: new LocalAuth({
-    // dataPath: './.wwebjs_auth', // uncomment to pin a folder
+    dataPath: './.wwebjs_auth', // uncomment to pin a folder
   }),
 });
 

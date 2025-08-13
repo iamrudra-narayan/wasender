@@ -295,7 +295,7 @@ small{display:block;margin-top:10px;color:var(--muted)}
 </head>
 <body>
   <div class="card">
-    <h1>QR Portal</h1>
+    <h1>KpiX WhatsApp Registration Portal</h1>
     <p>Sign in to access the WhatsApp QR and connection status.</p>
     <form method="POST" action="/qr/login">
       <label>Username</label>
@@ -346,7 +346,7 @@ app.get('/qr', qrLimiter, requireQrSession, (req, res) => {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>WhatsApp Login</title>
+<title>JpiX WhatsApp Login</title>
 <style>
 :root{--bg:#0b1020;--card:#121933;--muted:#9aa3b2;--ok:#16a34a;--warn:#f59e0b;--bad:#ef4444}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:#e5e7eb;min-height:100vh}

@@ -18,6 +18,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const { randomInt } = require('crypto');
+const cors = require('cors');
 
 dotenv.config();
 
@@ -64,6 +65,11 @@ const BULK_JITTER_MS = Number(process.env.BULK_JITTER_MS) || 300;
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({
+  origin: '*',
+  credentials: true,
+  methods: ['GET','POST'],
+}));
 app.use(compression());
 app.use(express.json({ limit: '512kb' }));
 app.use(express.urlencoded({ extended: false }));

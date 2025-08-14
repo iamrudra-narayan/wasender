@@ -356,108 +356,46 @@ function sleep(ms) {
 }
 
 /* ---------- Robust send function with retries + exponential backoff + jitter ---------- */
-async function sendWithRetryForNumber(phoneRaw, message, retries = BULK_RETRIES) {
-  if (!phoneRaw) return { success: false, error: 'invalid_phone' };
-
-  // Normalize number (strip non-digits)
-  const numberDigits = String(phoneRaw).replace(/[^\d]/g, '');
-  if (!numberDigits) return { success: false, error: 'invalid_phone' };
-
-  const plainNumber = numberDigits; // e.g. "919999999999"
+async function sendWithRetry(phone, message, retries = BULK_RETRIES) {
+  if (!phone) return { success: false, error: 'invalid_phone' };
+  const chatId = `${String(phone).replace(/[^\d]/g, '')}@c.us`;
   let attempt = 0;
 
   while (attempt <= retries) {
-    // Wait for client readiness (short wait)
     if (!isReady || !client) {
+      // wait briefly for client readiness
       let waited = 0;
-      while ((!isReady || !client) && waited < 60) {
+      while (!isReady && waited < 60) { // wait up to 60 seconds
         await sleep(1000);
         waited++;
       }
-      if (!isReady || !client) return { success: false, error: 'client_not_ready' };
+      if (!isReady) return { success: false, error: 'client_not_ready' };
     }
 
     try {
-      // Try getNumberId first (recommended)
-      const contact = await client.getNumberId(plainNumber);
-      let chatId;
-      if (contact && contact._serialized) {
-        chatId = contact._serialized;
-      } else {
-        // fallback to using phone@c.us
-        chatId = `${plainNumber}@c.us`;
-      }
-
-      // IMPORTANT: we await this one to ensure sequential per-worker sending
+      // sendMessage is awaited to ensure it's completed before next send
       await client.sendMessage(chatId, message);
       return { success: true };
     } catch (err) {
       attempt++;
       const msg = err && err.message ? err.message : String(err);
-      console.warn(`[SEND] attempt ${attempt}/${retries} failed for ${phoneRaw}: ${msg}`);
+      console.warn(`[SEND] attempt ${attempt}/${retries} failed for ${phone}: ${msg}`);
 
       if (attempt > retries) {
         return { success: false, error: msg };
       }
 
-      // exponential backoff + jitter
+      // backoff
       const base = BULK_RETRY_BASE_MS * Math.pow(2, attempt - 1);
       const jitter = randomInt(0, BULK_JITTER_MS + 1);
       const waitMs = base + jitter;
       await sleep(waitMs);
+
+      // loop and retry
     }
   }
 
   return { success: false, error: 'unknown' };
-}
-
-/* ---------- Worker-based bulk queue processor ---------- */
-async function sendBulkQueueProcessor(phoneNumbers, message, delayMs = BULK_DELAY_MS, concurrency = BULK_CONCURRENCY, retries = BULK_RETRIES) {
-  // clone
-  const queue = Array.from(phoneNumbers);
-
-  const sent_to = [];
-  const failed_to = [];
-
-  // worker function
-  async function worker(workerId) {
-    while (true) {
-      const phone = queue.shift();
-      if (!phone) break;
-
-      try {
-        console.log(`[BULK][W${workerId}] Sending to ${phone} ...`);
-        const r = await sendWithRetryForNumber(phone, message, retries);
-        if (r.success) {
-          sent_to.push(phone);
-          console.log(`[BULK][W${workerId}] ✅ Sent: ${phone}`);
-        } else {
-          failed_to.push({ phone, error: r.error });
-          console.log(`[BULK][W${workerId}] ❌ Failed: ${phone} -> ${r.error}`);
-        }
-      } catch (e) {
-        failed_to.push({ phone, error: (e && e.message) ? e.message : String(e) });
-        console.error(`[BULK][W${workerId}] Error processing ${phone}:`, e && e.stack ? e.stack : e);
-      }
-
-      // wait between sends for this worker
-      const jitter = randomInt(0, 1500);
-      const waitMs = Math.max(0, delayMs) + jitter;
-      await sleep(waitMs);
-    }
-  }
-
-  // start workers
-  const workers = [];
-  const actualConcurrency = Math.max(1, Math.min(concurrency, phoneNumbers.length));
-  for (let i = 0; i < actualConcurrency; i++) {
-    workers.push(worker(i + 1));
-  }
-
-  // wait for workers complete
-  await Promise.all(workers);
-
-  return { sent_to, failed_to };
 }
 
 /* ---------- Health / keepalive ---------- */
@@ -476,7 +414,7 @@ app.post('/send-message', verifyPasswordInBody, async (req, res) => {
     if (!phone_number || !message) return res.status(400).json({ status: 'error', message: 'phone_number and message are required' });
     if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
 
-    const r = await sendWithRetryForNumber(phone_number, message, BULK_RETRIES);
+    const r = await sendWithRetry(phone_number, message, BULK_RETRIES);
     if (r.success) return res.json({ status: 'success', sent_to: phone_number });
     return res.status(500).json({ status: 'error', message: r.error || 'failed to send' });
 
@@ -486,56 +424,276 @@ app.post('/send-message', verifyPasswordInBody, async (req, res) => {
   }
 });
 
-// Wait helper
-const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
+//   try {
+//     const { phone_numbers, message, delay_ms = 4000 } = req.body || {};
+//     if (!Array.isArray(phone_numbers) || phone_numbers.length === 0 || !message) {
+//       return res.status(400).json({ status: 'error', message: 'phone_numbers (non-empty array) and message are required' });
+//     }
+//     if (!isReady) {
+//       return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
+//     }
 
-/* ---------- Legacy helpers (kept for compatibility) ---------- */
-// Actual send function (kept but not used by the new queue; it's safe to keep)
-async function sendWhatsAppMessage(phone, message) {
-  try {
-    let number = String(phone).replace(/\D/g, '');
-    if (!number.endsWith('@c.us')) number = number + '@c.us';
-    const chat = await client.getNumberId(number.replace('@c.us', ''));
-    if (chat && chat._serialized) {
-      await client.sendMessage(chat._serialized, message);
-    } else {
-      await client.sendMessage(number, message);
-    }
-    return true;
-  } catch (err) {
-    throw new Error(err.message || String(err));
-  }
-}
+//     const sent_to = [];
+//     const failed_to = [];
 
-/* ---------- NEW send-bulk implementation (worker queue) ---------- */
+//     // Helper to wait between messages
+//     const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+//     for (const phone of phone_numbers) {
+//       try {
+//         await sendWhatsAppMessage(phone, message); // must be await to ensure sequential sending
+//         sent_to.push(phone);
+//         console.log(`[BULK] Sent to ${phone}`);
+//       } catch (e) {
+//         failed_to.push({ phone, error: e.message || String(e) });
+//         console.error(`[BULK ERROR] ${phone}: ${e.message || e}`);
+//       }
+//       await wait(delay_ms); // delay to avoid rate limiting and disconnect
+//     }
+
+//     return res.json({ 
+//       status: 'success', 
+//       sent_to, 
+//       failed_to, 
+//       delay_per_message_ms: delay_ms 
+//     });
+
+//   } catch (err) {
+//     console.error('[SENDBULK]', err && err.message ? err.message : err);
+//     return res.status(500).json({ status: 'error', message: err.message || String(err) });
+//   }
+// });
 app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
   try {
     const { phone_numbers, message, delay_ms } = req.body || {};
-    const baseDelay = typeof delay_ms === 'number' ? Math.max(0, delay_ms) : BULK_DELAY_MS;
+    const baseDelay = typeof delay_ms === 'number' ? Math.max(5000, delay_ms) : Math.max(BULK_DELAY_MS, 5000); // Minimum 5 seconds
 
     if (!Array.isArray(phone_numbers) || phone_numbers.length === 0 || !message) {
       return res.status(400).json({ status: 'error', message: 'phone_numbers (array) and message are required' });
     }
-    if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
 
-    // Start worker queue processor
-    console.log(`[SENDBULK] Starting bulk send: count=${phone_numbers.length} concurrency=${BULK_CONCURRENCY} delay_ms=${baseDelay}`);
+    if (!isReady) {
+      return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
+    }
 
-    const result = await sendBulkQueueProcessor(phone_numbers, message, baseDelay, BULK_CONCURRENCY, BULK_RETRIES);
+    // Limit batch size to prevent disconnection
+    const MAX_BATCH_SIZE = 10;
+    if (phone_numbers.length > MAX_BATCH_SIZE) {
+      return res.status(400).json({ 
+        status: 'error', 
+        message: `Batch size too large. Maximum ${MAX_BATCH_SIZE} numbers allowed per request. Split into smaller batches.` 
+      });
+    }
 
-    console.log('[SENDBULK] Finished bulk send', { sent: result.sent_to.length, failed: result.failed_to.length });
+    console.log(`[SENDBULK] Starting bulk send: count=${phone_numbers.length} delay_ms=${baseDelay}`);
+
+    // Use sequential processing instead of concurrent to avoid disconnection
+    const result = await sendBulkSequential(phone_numbers, message, baseDelay);
+
+    console.log('[SENDBULK] Finished bulk send', { 
+      sent: result.sent_to.length, 
+      failed: result.failed_to.length 
+    });
 
     return res.json({
       status: 'success',
       sent_to: result.sent_to,
       failed_to: result.failed_to,
       total_attempted: phone_numbers.length,
-      delay_base_ms: baseDelay
+      delay_base_ms: baseDelay,
+      warning: phone_numbers.length > 5 ? 'Large batches may cause WhatsApp to disconnect. Consider smaller batches.' : null
     });
 
   } catch (err) {
     console.error('[SEND-BULK]', err && err.stack ? err.stack : err);
-    return res.status(500).json({ status: 'error', message: err && err.message ? err.message : String(err) });
+    return res.status(500).json({ 
+      status: 'error', 
+      message: err && err.message ? err.message : String(err) 
+    });
+  }
+});
+
+// Sequential bulk sender to avoid overwhelming WhatsApp
+async function sendBulkSequential(phoneNumbers, message, baseDelay) {
+  const sent_to = [];
+  const failed_to = [];
+  
+  for (let i = 0; i < phoneNumbers.length; i++) {
+    const phoneNumber = phoneNumbers[i];
+    
+    try {
+      // Check if client is still ready before each send
+      if (!isReady) {
+        console.log(`[SENDBULK] Client disconnected at number ${i + 1}/${phoneNumbers.length}`);
+        // Add remaining numbers to failed list
+        for (let j = i; j < phoneNumbers.length; j++) {
+          failed_to.push({
+            phone: phoneNumbers[j],
+            error: 'WhatsApp client disconnected during bulk send'
+          });
+        }
+        break;
+      }
+
+      console.log(`[SENDBULK] Sending to ${phoneNumber} (${i + 1}/${phoneNumbers.length})`);
+      
+      // Add random variation to delay to appear more human-like
+      const randomDelay = baseDelay + Math.random() * 2000; // Add 0-2 seconds variation
+      
+      if (i > 0) {
+        console.log(`[SENDBULK] Waiting ${Math.round(randomDelay)}ms before next send...`);
+        await new Promise(resolve => setTimeout(resolve, randomDelay));
+      }
+
+      // Send message with retry logic
+      const success = await sendMessageWithRetry(phoneNumber, message, 2);
+      
+      if (success) {
+        sent_to.push(phoneNumber);
+        console.log(`[SENDBULK] ✓ Sent to ${phoneNumber}`);
+      } else {
+        failed_to.push({
+          phone: phoneNumber,
+          error: 'Failed after retries'
+        });
+        console.log(`[SENDBULK] ✗ Failed to send to ${phoneNumber}`);
+      }
+
+    } catch (error) {
+      console.error(`[SENDBULK] Error sending to ${phoneNumber}:`, error.message);
+      failed_to.push({
+        phone: phoneNumber,
+        error: error.message
+      });
+    }
+  }
+
+  return { sent_to, failed_to };
+}
+
+// Enhanced message sender with connection checking
+async function sendMessageWithRetry(phoneNumber, message, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Check connection before attempting
+      if (!client || !isReady) {
+        throw new Error('WhatsApp client not ready');
+      }
+
+      // Format phone number (adjust based on your formatting logic)
+      const formattedNumber = formatPhoneNumber(phoneNumber);
+      
+      // Send message
+      await client.sendMessage(formattedNumber, message);
+      
+      return true; // Success
+      
+    } catch (error) {
+      console.log(`[RETRY] Attempt ${attempt}/${maxRetries} failed for ${phoneNumber}: ${error.message}`);
+      
+      if (attempt < maxRetries) {
+        // Wait before retry with exponential backoff
+        const retryDelay = 3000 * Math.pow(2, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+    }
+  }
+  
+  return false; // Failed after all retries
+}
+
+// Helper function to format phone number (adjust based on your needs)
+function formatPhoneNumber(phoneNumber) {
+  // Remove any non-digit characters
+  const cleaned = phoneNumber.replace(/\D/g, '');
+  
+  // Add country code if missing (adjust based on your region)
+  let formatted = cleaned;
+  if (!formatted.startsWith('91') && formatted.length === 10) {
+    formatted = '91' + formatted; // Add India country code
+  }
+  
+  return formatted + '@c.us';
+}
+
+// Add connection monitoring
+function setupConnectionMonitoring() {
+  if (client) {
+    client.on('disconnected', (reason) => {
+      console.log('[CLIENT] WhatsApp disconnected:', reason);
+      isReady = false;
+    });
+
+    client.on('ready', () => {
+      console.log('[CLIENT] WhatsApp ready');
+      isReady = true;
+    });
+
+    client.on('auth_failure', (msg) => {
+      console.error('[CLIENT] Authentication failure:', msg);
+      isReady = false;
+    });
+  }
+}
+
+// Rate limiting endpoint for better control
+app.post('/send-bulk-batch', verifyPasswordInBody, async (req, res) => {
+  try {
+    const { phone_numbers, message, delay_ms, batch_size = 5 } = req.body || {};
+    
+    if (!Array.isArray(phone_numbers) || phone_numbers.length === 0 || !message) {
+      return res.status(400).json({ status: 'error', message: 'phone_numbers (array) and message are required' });
+    }
+
+    if (!isReady) {
+      return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready' });
+    }
+
+    const batches = [];
+    for (let i = 0; i < phone_numbers.length; i += batch_size) {
+      batches.push(phone_numbers.slice(i, i + batch_size));
+    }
+
+    console.log(`[BATCH-SEND] Processing ${batches.length} batches of max ${batch_size} numbers each`);
+
+    const allResults = {
+      sent_to: [],
+      failed_to: [],
+      batches_processed: 0
+    };
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      
+      console.log(`[BATCH-SEND] Processing batch ${batchIndex + 1}/${batches.length}`);
+      
+      const batchResult = await sendBulkSequential(batch, message, delay_ms || 10000);
+      
+      allResults.sent_to.push(...batchResult.sent_to);
+      allResults.failed_to.push(...batchResult.failed_to);
+      allResults.batches_processed++;
+
+      // Wait between batches to avoid detection
+      if (batchIndex < batches.length - 1) {
+        const batchDelay = 30000; // 30 seconds between batches
+        console.log(`[BATCH-SEND] Waiting ${batchDelay}ms before next batch...`);
+        await new Promise(resolve => setTimeout(resolve, batchDelay));
+      }
+    }
+
+    return res.json({
+      status: 'success',
+      ...allResults,
+      total_attempted: phone_numbers.length
+    });
+
+  } catch (err) {
+    console.error('[BATCH-SEND]', err);
+    return res.status(500).json({ 
+      status: 'error', 
+      message: err.message 
+    });
   }
 });
 
@@ -610,12 +768,7 @@ app.post('/qr/logout', requireQrSession, (req, res) => {
 // QR page (requires session)
 app.get('/qr', qrLimiter, requireQrSession, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>KpiX WhatsApp Login</title>
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KpiX WhatsApp Login</title>
 <style>
 :root{--bg:#0b1020;--card:#121933;--muted:#9aa3b2;--ok:#16a34a;--warn:#f59e0b;--bad:#ef4444}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:#e5e7eb;min-height:100vh}
@@ -698,8 +851,7 @@ async function refresh(){
 refresh();
 setInterval(refresh, 5000);
 </script>
-</body>
-</html>`);
+</body></html>`);
 });
 
 // QR image (requires session)

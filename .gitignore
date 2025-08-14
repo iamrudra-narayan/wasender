@@ -1,9 +1,11 @@
 node_modules/
 dist/
 .zencoder
-.wwebjs_auth
-.wwebjs_data
 session.json
 session.data.json
 .cache_tmp
-.wwebjs_cache
+.wwebjs_cache/
+.wwebjs_data/
+.wwebjs_auth/
+auth/
+session.json

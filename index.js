@@ -17,6 +17,7 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const { randomInt } = require('crypto');
 
 dotenv.config();
 
@@ -51,6 +52,13 @@ if (!MONGO_URI) {
 // ensure local dirs exist (harmless if using remote)
 try { fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch {}
+
+/* ---------- Bulk config (tune for production) ---------- */
+const BULK_CONCURRENCY = Number(process.env.BULK_CONCURRENCY) || 2; // safe default
+const BULK_DELAY_MS = Number(process.env.BULK_DELAY_MS) || 1500; // ms delay between sends per worker
+const BULK_RETRIES = Number(process.env.BULK_RETRIES) || 3;
+const BULK_RETRY_BASE_MS = Number(process.env.BULK_RETRY_BASE_MS) || 800;
+const BULK_JITTER_MS = Number(process.env.BULK_JITTER_MS) || 300;
 
 /* ---------- App ---------- */
 const app = express();
@@ -197,12 +205,6 @@ function redirectToLogin(res) {
   return res.redirect('/qr/login');
 }
 
-async function sendWhatsAppMessage(phone, message) {
-  if (!isReady || !client) throw new Error('WhatsApp client not ready');
-  const chatId = `${String(phone).replace(/[^\d]/g, '')}@c.us`;
-  return client.sendMessage(chatId, message);
-}
-
 async function rimraf(dir) {
   try { await fsp.rm(dir, { recursive: true, force: true }); } catch (e) {}
   try { await fsp.mkdir(dir, { recursive: true }); } catch (e) {}
@@ -226,7 +228,7 @@ async function initMongooseStoreIfNeeded() {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       await mongoose.connect(MONGO_URI, {
-        // Mongoose v6+ defaults are fine; optionally set dbName in URI or here.
+        // Mongoose v6+ defaults are fine
       });
       console.log('✅ Mongoose connected');
       break;
@@ -348,6 +350,116 @@ async function tryRebuildClient(reason = '') {
   initializingClient = false;
 }
 
+/* ---------- Utility sleep ---------- */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/* ---------- Robust send function with retries + exponential backoff + jitter ---------- */
+async function sendWithRetryForNumber(phoneRaw, message, retries = BULK_RETRIES) {
+  if (!phoneRaw) return { success: false, error: 'invalid_phone' };
+
+  // Normalize number (strip non-digits)
+  const numberDigits = String(phoneRaw).replace(/[^\d]/g, '');
+  if (!numberDigits) return { success: false, error: 'invalid_phone' };
+
+  const plainNumber = numberDigits; // e.g. "919999999999"
+  let attempt = 0;
+
+  while (attempt <= retries) {
+    // Wait for client readiness (short wait)
+    if (!isReady || !client) {
+      let waited = 0;
+      while ((!isReady || !client) && waited < 60) {
+        await sleep(1000);
+        waited++;
+      }
+      if (!isReady || !client) return { success: false, error: 'client_not_ready' };
+    }
+
+    try {
+      // Try getNumberId first (recommended)
+      const contact = await client.getNumberId(plainNumber);
+      let chatId;
+      if (contact && contact._serialized) {
+        chatId = contact._serialized;
+      } else {
+        // fallback to using phone@c.us
+        chatId = `${plainNumber}@c.us`;
+      }
+
+      // IMPORTANT: we await this one to ensure sequential per-worker sending
+      await client.sendMessage(chatId, message);
+      return { success: true };
+    } catch (err) {
+      attempt++;
+      const msg = err && err.message ? err.message : String(err);
+      console.warn(`[SEND] attempt ${attempt}/${retries} failed for ${phoneRaw}: ${msg}`);
+
+      if (attempt > retries) {
+        return { success: false, error: msg };
+      }
+
+      // exponential backoff + jitter
+      const base = BULK_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+      const jitter = randomInt(0, BULK_JITTER_MS + 1);
+      const waitMs = base + jitter;
+      await sleep(waitMs);
+    }
+  }
+
+  return { success: false, error: 'unknown' };
+}
+
+/* ---------- Worker-based bulk queue processor ---------- */
+async function sendBulkQueueProcessor(phoneNumbers, message, delayMs = BULK_DELAY_MS, concurrency = BULK_CONCURRENCY, retries = BULK_RETRIES) {
+  // clone
+  const queue = Array.from(phoneNumbers);
+
+  const sent_to = [];
+  const failed_to = [];
+
+  // worker function
+  async function worker(workerId) {
+    while (true) {
+      const phone = queue.shift();
+      if (!phone) break;
+
+      try {
+        console.log(`[BULK][W${workerId}] Sending to ${phone} ...`);
+        const r = await sendWithRetryForNumber(phone, message, retries);
+        if (r.success) {
+          sent_to.push(phone);
+          console.log(`[BULK][W${workerId}] ✅ Sent: ${phone}`);
+        } else {
+          failed_to.push({ phone, error: r.error });
+          console.log(`[BULK][W${workerId}] ❌ Failed: ${phone} -> ${r.error}`);
+        }
+      } catch (e) {
+        failed_to.push({ phone, error: (e && e.message) ? e.message : String(e) });
+        console.error(`[BULK][W${workerId}] Error processing ${phone}:`, e && e.stack ? e.stack : e);
+      }
+
+      // wait between sends for this worker
+      const jitter = randomInt(0, 1500);
+      const waitMs = Math.max(0, delayMs) + jitter;
+      await sleep(waitMs);
+    }
+  }
+
+  // start workers
+  const workers = [];
+  const actualConcurrency = Math.max(1, Math.min(concurrency, phoneNumbers.length));
+  for (let i = 0; i < actualConcurrency; i++) {
+    workers.push(worker(i + 1));
+  }
+
+  // wait for workers complete
+  await Promise.all(workers);
+
+  return { sent_to, failed_to };
+}
+
 /* ---------- Health / keepalive ---------- */
 app.get('/healthz', (req, res) => res.json({ ok: true, isReady }));
 setInterval(() => console.log('[KEEPALIVE] tick'), 5 * 60 * 1000);
@@ -363,43 +475,67 @@ app.post('/send-message', verifyPasswordInBody, async (req, res) => {
     const { phone_number, message } = req.body || {};
     if (!phone_number || !message) return res.status(400).json({ status: 'error', message: 'phone_number and message are required' });
     if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
-    await sendWhatsAppMessage(phone_number, message);
-    return res.json({ status: 'success', sent_to: phone_number });
+
+    const r = await sendWithRetryForNumber(phone_number, message, BULK_RETRIES);
+    if (r.success) return res.json({ status: 'success', sent_to: phone_number });
+    return res.status(500).json({ status: 'error', message: r.error || 'failed to send' });
+
   } catch (err) {
     console.error('[SEND]', err && err.message ? err.message : err);
     return res.status(500).json({ status: 'error', message: err.message || String(err) });
   }
 });
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Wait helper
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/* ---------- Legacy helpers (kept for compatibility) ---------- */
+// Actual send function (kept but not used by the new queue; it's safe to keep)
+async function sendWhatsAppMessage(phone, message) {
+  try {
+    let number = String(phone).replace(/\D/g, '');
+    if (!number.endsWith('@c.us')) number = number + '@c.us';
+    const chat = await client.getNumberId(number.replace('@c.us', ''));
+    if (chat && chat._serialized) {
+      await client.sendMessage(chat._serialized, message);
+    } else {
+      await client.sendMessage(number, message);
+    }
+    return true;
+  } catch (err) {
+    throw new Error(err.message || String(err));
+  }
 }
 
+/* ---------- NEW send-bulk implementation (worker queue) ---------- */
 app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
   try {
-    const { phone_numbers, message } = req.body || {};
+    const { phone_numbers, message, delay_ms } = req.body || {};
+    const baseDelay = typeof delay_ms === 'number' ? Math.max(0, delay_ms) : BULK_DELAY_MS;
+
     if (!Array.isArray(phone_numbers) || phone_numbers.length === 0 || !message) {
-      return res.status(400).json({ status: 'error', message: 'phone_numbers (non-empty array) and message are required' });
+      return res.status(400).json({ status: 'error', message: 'phone_numbers (array) and message are required' });
     }
     if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
 
-    const sent_to = [];
-    const failed_to = [];
+    // Start worker queue processor
+    console.log(`[SENDBULK] Starting bulk send: count=${phone_numbers.length} concurrency=${BULK_CONCURRENCY} delay_ms=${baseDelay}`);
 
-    for (const phone of phone_numbers) {
-      try {
-        await sendWhatsAppMessage(phone, message);
-        sent_to.push(phone);
-        await sleep(2000); // Wait 2 seconds before sending the next message
-      } catch (e) {
-        failed_to.push({ phone, error: e.message || String(e) });
-      }
-    }
+    const result = await sendBulkQueueProcessor(phone_numbers, message, baseDelay, BULK_CONCURRENCY, BULK_RETRIES);
 
-    return res.json({ status: 'success', sent_to, failed_to });
+    console.log('[SENDBULK] Finished bulk send', { sent: result.sent_to.length, failed: result.failed_to.length });
+
+    return res.json({
+      status: 'success',
+      sent_to: result.sent_to,
+      failed_to: result.failed_to,
+      total_attempted: phone_numbers.length,
+      delay_base_ms: baseDelay
+    });
+
   } catch (err) {
-    console.error('[SENDBULK]', err?.message || err);
-    return res.status(500).json({ status: 'error', message: err.message || String(err) });
+    console.error('[SEND-BULK]', err && err.stack ? err.stack : err);
+    return res.status(500).json({ status: 'error', message: err && err.message ? err.message : String(err) });
   }
 });
 
@@ -474,7 +610,12 @@ app.post('/qr/logout', requireQrSession, (req, res) => {
 // QR page (requires session)
 app.get('/qr', qrLimiter, requireQrSession, (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>KpiX WhatsApp Login</title>
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KpiX WhatsApp Login</title>
 <style>
 :root{--bg:#0b1020;--card:#121933;--muted:#9aa3b2;--ok:#16a34a;--warn:#f59e0b;--bad:#ef4444}
 *{box-sizing:border-box}body{margin:0;background:#0b1020;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:#e5e7eb;min-height:100vh}
@@ -557,7 +698,8 @@ async function refresh(){
 refresh();
 setInterval(refresh, 5000);
 </script>
-</body></html>`);
+</body>
+</html>`);
 });
 
 // QR image (requires session)
@@ -611,7 +753,7 @@ app.post('/qr/disconnect', qrLimiter, requireQrSession, async (req, res) => {
 app.use((req, res) => res.status(404).json({ status: 'error', message: 'Not Found' }));
 
 app.use((err, req, res, next) => {
-  console.error('[UNCAUGHT]', err && err.message ? err.message : err);
+  console.error('[UNCAUGHT]', err && err.stack ? err.stack : err);
   res.status(500).json({ status: 'error', message: 'Internal Server Error' });
 });
 
@@ -651,7 +793,7 @@ process.on('uncaughtException', (err) => console.error('[UNCAUGHT EXCEPTION]', e
       }
     });
   } catch (err) {
-    console.error('[STARTUP] Failed to start:', err && err.message ? err.message : err);
+    console.error('[STARTUP] Failed to start:', err && err.stack ? err.stack : err);
     process.exit(1);
   }
 })();

@@ -371,6 +371,10 @@ app.post('/send-message', verifyPasswordInBody, async (req, res) => {
   }
 });
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
   try {
     const { phone_numbers, message } = req.body || {};
@@ -378,19 +382,23 @@ app.post('/send-bulk', verifyPasswordInBody, async (req, res) => {
       return res.status(400).json({ status: 'error', message: 'phone_numbers (non-empty array) and message are required' });
     }
     if (!isReady) return res.status(409).json({ status: 'error', message: 'WhatsApp client not ready. Open the QR portal to login.' });
+
     const sent_to = [];
     const failed_to = [];
+
     for (const phone of phone_numbers) {
       try {
         await sendWhatsAppMessage(phone, message);
         sent_to.push(phone);
+        await sleep(2000); // Wait 2 seconds before sending the next message
       } catch (e) {
         failed_to.push({ phone, error: e.message || String(e) });
       }
     }
+
     return res.json({ status: 'success', sent_to, failed_to });
   } catch (err) {
-    console.error('[SENDBULK]', err && err.message ? err.message : err);
+    console.error('[SENDBULK]', err?.message || err);
     return res.status(500).json({ status: 'error', message: err.message || String(err) });
   }
 });
